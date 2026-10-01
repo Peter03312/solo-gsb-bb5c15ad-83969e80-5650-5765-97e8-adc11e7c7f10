@@ -109,6 +109,21 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, H.correctSlot(db, id, body || {}));
     }
 
+    // 计划外曝光记录（布展 / 搬运等排期外受光）
+    if (req.method === 'GET' && pathname === '/api/exposure-records') {
+      return sendJson(res, 200, H.listExposureRecords(db, url.searchParams));
+    }
+    if (req.method === 'POST' && pathname === '/api/exposure-records') {
+      return sendJson(res, 200, H.createExposureRecord(db, body));
+    }
+    const mRec = pathname.match(/^\/api\/exposure-records\/(\d+)\/(correct|void)$/);
+    if (mRec && req.method === 'POST') {
+      const id = H.parseId(mRec[1]);
+      if (id === null) return sendJson(res, 404, { error: { code: 'NOT_FOUND', message: '计划外记录不存在' } });
+      if (mRec[2] === 'correct') return sendJson(res, 200, H.correctExposureRecord(db, id, body || {}));
+      return sendJson(res, 200, H.voidExposureRecord(db, id, body || {}));
+    }
+
     sendJson(res, 404, { error: { code: 'NOT_FOUND', message: '接口不存在' } });
   } catch (err) {
     if (err instanceof H.HttpError) {

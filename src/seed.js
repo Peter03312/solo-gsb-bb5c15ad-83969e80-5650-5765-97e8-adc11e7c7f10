@@ -99,6 +99,45 @@ function seed(db) {
   insMem.run(g1, artIds.w1);
   insMem.run(g1, artIds.w2);
 
+  // 计划外曝光演示：布展搬运等排期外受光（单件作品 + 实际起止 + 连续照度分段）。
+  // 有效记录：摄影作品 09-28 搬运入库，两段照度，合计 60*80 + 30*120 = 8400 lux·min。
+  const rec1Segs = [
+    { start: '2026-09-28T14:00', end: '2026-09-28T15:00', lux: 80, minutes: 60, exposure: 4800 },
+    { start: '2026-09-28T15:00', end: '2026-09-28T15:30', lux: 120, minutes: 30, exposure: 3600 },
+  ];
+  db.prepare(`
+    INSERT INTO exposure_records (
+      artwork_id, status, reason_kind, note,
+      actual_start, actual_end, actual_lux, actual_minutes, actual_exposure,
+      actual_segments, created_at
+    ) VALUES (?, 'active', '搬运入库', '拆箱后经由周转区进入库房',
+              '2026-09-28T14:00', '2026-09-28T15:30', NULL, 90, 8400, ?, '2026-09-28T16:00')
+  `).run(artIds.w3, JSON.stringify(rec1Segs));
+
+  // 已作废记录：最初误录的一次布展受光，已带理由作废（归档保留、不计入已用量）。
+  const voidSegs = [
+    { start: '2026-09-27T10:00', end: '2026-09-27T11:00', lux: 200, minutes: 60, exposure: 12000 },
+  ];
+  const rec2 = db.prepare(`
+    INSERT INTO exposure_records (
+      artwork_id, status, reason_kind, note,
+      actual_start, actual_end, actual_lux, actual_minutes, actual_exposure,
+      actual_segments, created_at
+    ) VALUES (?, 'void', '布展', '误把展厅常规调试灯计入，复核后作废',
+              '2026-09-27T10:00', '2026-09-27T11:00', 200, 60, 12000, ?, '2026-09-27T11:10')
+  `).run(artIds.w3, JSON.stringify(voidSegs)).lastInsertRowid;
+  db.prepare(`
+    INSERT INTO exposure_record_changes (
+      record_id, change_type, seq_no, reason,
+      before_status, before_start, before_end, before_lux, before_minutes, before_exposure, before_segments,
+      after_status, after_start, after_end, after_lux, after_minutes, after_exposure, after_segments,
+      created_at
+    ) VALUES (?, 'void', 1, '复核确认该时段为展厅调试灯，非作品受光，作废此误录',
+              'active', '2026-09-27T10:00', '2026-09-27T11:00', 200, 60, 12000, ?,
+              'void', '2026-09-27T10:00', '2026-09-27T11:00', 200, 60, 12000, ?,
+              '2026-09-27T11:20')
+  `).run(rec2, JSON.stringify(voidSegs), JSON.stringify(voidSegs));
+
   const tx = db.transaction(() => recomputeBlocked(db));
   tx.immediate();
   return true;

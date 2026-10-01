@@ -241,6 +241,66 @@ function parseJsonArr(s) {
   try { const v = JSON.parse(s); return Array.isArray(v) ? v : []; } catch { return []; }
 }
 
+// ---------- 计划外曝光记录（布展 / 搬运等排期外受光） ----------
+function loadExposureRecords(db) {
+  return db.prepare('SELECT * FROM exposure_records ORDER BY actual_start, id').all();
+}
+
+function loadExposureChanges(db) {
+  return db.prepare('SELECT * FROM exposure_record_changes ORDER BY record_id, seq_no, id')
+    .all().map(exposureChangeDto);
+}
+
+function loadRecordSegments(rec) {
+  return parseJsonArr(rec.actual_segments);
+}
+
+function exposureChangeDto(r) {
+  return {
+    id: r.id,
+    recordId: r.record_id,
+    changeType: r.change_type,       // correct 更正 / void 作废
+    seqNo: r.seq_no,
+    reason: r.reason,
+    createdAt: r.created_at,
+    before: {
+      status: r.before_status,
+      start: r.before_start, end: r.before_end, lux: r.before_lux,
+      minutes: r.before_minutes, exposure: r.before_exposure,
+      segments: parseJsonArr(r.before_segments),
+    },
+    after: {
+      status: r.after_status,
+      start: r.after_start, end: r.after_end, lux: r.after_lux,
+      minutes: r.after_minutes, exposure: r.after_exposure,
+      segments: parseJsonArr(r.after_segments),
+    },
+  };
+}
+
+function exposureRecordDto(rec, artworksById, changesByRecord) {
+  const segs = loadRecordSegments(rec);
+  const a = artworksById.get(rec.artwork_id);
+  return {
+    id: rec.id,
+    artworkId: rec.artwork_id,
+    artworkName: a ? a.name : `#${rec.artwork_id}`,
+    status: rec.status,               // active 有效 / void 已作废
+    active: rec.status === 'active',
+    reasonKind: rec.reason_kind,
+    note: rec.note,
+    actualStart: rec.actual_start,
+    actualEnd: rec.actual_end,
+    actualLux: representativeLux(segs),
+    actualMinutes: rec.actual_minutes,
+    actualExposure: rec.actual_exposure,
+    actualSegments: segs,
+    segmentCount: segs.length,
+    createdAt: rec.created_at,
+    changes: changesByRecord ? (changesByRecord.get(rec.id) || []) : [],
+  };
+}
+
 function slotDto(slot, artworksById, correctionsBySlot) {
   const planned = plannedExposure(slot);
   const actual = slot.status === 'finished' ? slot.actual_exposure : actualExposure(slot);
@@ -279,16 +339,24 @@ function slotDto(slot, artworksById, correctionsBySlot) {
 function summarize(db) {
   const artworks = loadArtworks(db);
   const slots = loadSlots(db);
+  const records = loadExposureRecords(db);
   const artworksById = new Map(artworks.map((a) => [a.id, a]));
   const correctionsBySlot = new Map();
   for (const c of loadCorrections(db)) {
     if (!correctionsBySlot.has(c.slotId)) correctionsBySlot.set(c.slotId, []);
     correctionsBySlot.get(c.slotId).push(c);
   }
+  const changesByRecord = new Map();
+  for (const c of loadExposureChanges(db)) {
+    if (!changesByRecord.has(c.recordId)) changesByRecord.set(c.recordId, []);
+    changesByRecord.get(c.recordId).push(c);
+  }
 
   const acc = new Map();
   for (const a of artworks) {
-    acc.set(a.id, { used: a.existing_amount, reservedRunning: 0, reservedScheduled: 0 });
+    acc.set(a.id, {
+      used: a.existing_amount, reservedRunning: 0, reservedScheduled: 0, unscheduledUsed: 0,
+    });
   }
 
   for (const slot of slots) {
@@ -301,6 +369,14 @@ function summarize(db) {
       else if (slot.status === 'running') row.reservedRunning += expo || 0;
       else row.reservedScheduled += expo || 0; // 含被标记为不可启动的时段
     }
+  }
+
+  // 计划外有效记录计入已用（已作废记录不参与任何核算）
+  for (const rec of records) {
+    if (rec.status !== 'active' || !acc.has(rec.artwork_id)) continue;
+    const row = acc.get(rec.artwork_id);
+    row.used += rec.actual_exposure || 0;
+    row.unscheduledUsed += rec.actual_exposure || 0;
   }
 
   const artworkDtos = artworks.map((a) => {
@@ -316,6 +392,7 @@ function summarize(db) {
       existing: a.existing_amount,
       note: a.note,
       used,
+      unscheduledUsed: round3(r.unscheduledUsed),
       reserved,
       reservedRunning: round3(r.reservedRunning),
       reservedScheduled: round3(r.reservedScheduled),
@@ -325,16 +402,17 @@ function summarize(db) {
     };
   });
 
-  // 额度组汇总：组已用 = 成员既有累计 + 已结束实际曝光；预占 = 进行中冻结 + 未开始计划；
-  // 同一时段有多件组内作品时逐件计入（成员各自累计，组取成员之和）。
+  // 额度组汇总：组已用 = 成员既有累计 + 已结束实际曝光 + 计划外有效记录曝光；
+  // 预占 = 进行中冻结 + 未开始计划；同一时段有多件组内作品时逐件计入。
   const groupDtos = loadGroups(db).map((g) => {
-    let used = 0, reservedRunning = 0, reservedScheduled = 0;
+    let used = 0, reservedRunning = 0, reservedScheduled = 0, unscheduledUsed = 0;
     for (const aid of g.memberIds) {
       const r = acc.get(aid);
       if (!r) continue;
       used += r.used;
       reservedRunning += r.reservedRunning;
       reservedScheduled += r.reservedScheduled;
+      unscheduledUsed += r.unscheduledUsed;
     }
     used = round3(used);
     const reserved = round3(reservedRunning + reservedScheduled);
@@ -349,6 +427,7 @@ function summarize(db) {
         return { id: aid, name: a ? a.name : `#${aid}` };
       }),
       used,
+      unscheduledUsed: round3(unscheduledUsed),
       reserved,
       reservedRunning: round3(reservedRunning),
       reservedScheduled: round3(reservedScheduled),
@@ -363,6 +442,7 @@ function summarize(db) {
     artworks: artworkDtos,
     groups: groupDtos,
     slots: slots.map((s) => slotDto(s, artworksById, correctionsBySlot)),
+    exposureRecords: records.map((r) => exposureRecordDto(r, artworksById, changesByRecord)),
   };
 }
 
@@ -399,6 +479,14 @@ function recomputeBlocked(db) {
     const gid = groupOf.get(aid);
     if (gid != null) groupUsed.set(gid, groupUsed.get(gid) + expo);
   };
+
+  // 计划外有效记录：属于历史实耗，进入单件与组的核算基线（允许因此把余额压成负数）
+  for (const rec of loadExposureRecords(db)) {
+    if (rec.status !== 'active') continue;
+    const expo = rec.actual_exposure || 0;
+    if (used.has(rec.artwork_id)) used.set(rec.artwork_id, used.get(rec.artwork_id) + expo);
+    addGroup(rec.artwork_id, expo);
+  }
 
   for (const s of slots) {
     if (s.status === 'finished') {
@@ -496,6 +584,10 @@ module.exports = {
   representativeLux,
   plannedExposure,
   actualExposure,
+  loadExposureRecords,
+  loadExposureChanges,
+  loadRecordSegments,
+  exposureRecordDto,
   summarize,
   recomputeBlocked,
   bumpVersion,

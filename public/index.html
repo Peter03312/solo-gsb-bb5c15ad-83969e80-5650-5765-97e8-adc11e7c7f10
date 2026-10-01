@@ -99,6 +99,35 @@
       </div>
     </section>
 
+    <!-- 计划外曝光记录（布展 / 搬运等排期外受光） -->
+    <section class="card">
+      <div class="card-head">
+        <h2>计划外曝光记录（布展 / 搬运）</h2>
+        <div class="hint">排期外受光按单件作品登记实际起止与连续照度分段；分段须首尾衔接、完整覆盖、照度非负。有效记录计入作品与额度组已用；与已有时段、其他有效记录或后续排期重叠均拒绝。已归档记录只能带理由<strong>更正分段</strong>（区间沿用）或<strong>作废</strong>，前后值全程留痕。</div>
+        <div class="head-actions">
+          <select id="recFilterArt" class="rec-filter" title="按作品筛选"></select>
+          <select id="recFilterStatus" class="rec-filter" title="按状态筛选">
+            <option value="">全部状态</option>
+            <option value="active">仅有效</option>
+            <option value="void">仅已作废</option>
+          </select>
+          <button class="btn btn-primary" id="addRecordBtn">＋ 登记计划外受光</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table" id="recordTable">
+          <thead>
+            <tr>
+              <th>#</th><th>作品</th><th>状态</th><th>事由</th>
+              <th>实际起止</th><th class="num">时长(分)</th><th class="num">照度</th><th class="num">本次曝光</th>
+              <th>分段</th><th>备注</th><th>操作</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
     <!-- 未开始排期（整批编辑） -->
     <section class="card">
       <div class="card-head">
@@ -216,6 +245,87 @@
       <div class="modal-actions">
         <button class="btn" data-close>取消</button>
         <button class="btn btn-primary" id="cr_save">提交更正</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 计划外受光登记弹窗 -->
+  <div class="modal-mask hidden" id="recordModal">
+    <div class="modal modal-wide">
+      <h3>登记计划外受光（布展 / 搬运等）</h3>
+      <div class="form-row">
+        <label>作品（单件）</label>
+        <select id="rc_artwork"></select>
+      </div>
+      <div class="form-row">
+        <label>事由</label>
+        <input type="text" id="rc_kind" maxlength="50" placeholder="如：布展 / 搬运入库 / 撤展" list="recKindList" />
+        <datalist id="recKindList">
+          <option value="布展"></option>
+          <option value="搬运入库"></option>
+          <option value="搬运出库"></option>
+          <option value="撤展"></option>
+          <option value="库房检查"></option>
+        </datalist>
+      </div>
+      <div class="form-row"><label>实际开始时间</label><input type="datetime-local" id="rc_start" /></div>
+      <div class="form-row"><label>实际结束时间</label><input type="datetime-local" id="rc_end" /></div>
+      <div class="seg-editor-head">
+        <span>连续照度分段（每段含起止与非负照度，首尾衔接、无重叠，完整覆盖实际区间）</span>
+        <button type="button" class="btn btn-sm" id="rc_addSeg">＋ 添加分段</button>
+      </div>
+      <div id="rc_segments"></div>
+      <div class="form-row computed">
+        <span>总时长：<strong id="rc_totalMins">–</strong> 分 ｜ 本次曝光：<strong id="rc_preview">–</strong> lux·min</span>
+      </div>
+      <div class="form-row"><label>备注</label><input type="text" id="rc_note" maxlength="200" /></div>
+      <div class="form-error hidden" id="rc_error"></div>
+      <div class="modal-actions">
+        <button class="btn" data-close>取消</button>
+        <button class="btn btn-primary" id="rc_save">登记并核算</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 计划外记录分段更正弹窗 -->
+  <div class="modal-mask hidden" id="recCorrectModal">
+    <div class="modal modal-wide">
+      <h3>计划外记录 · 分段更正</h3>
+      <div class="corr-range" id="rcc_range"></div>
+      <div class="seg-editor-head">
+        <span>完整分段（起止沿用原实际区间；首尾衔接、无重叠，完整覆盖原区间）</span>
+        <button type="button" class="btn btn-sm" id="rcc_addSeg">＋ 添加分段</button>
+      </div>
+      <div id="rcc_segments"></div>
+      <div class="form-row computed">
+        <span>总时长：<strong id="rcc_totalMins">–</strong> 分 ｜ 更正前曝光 <strong id="rcc_beforeExpo">–</strong> → 更正后曝光 <strong id="rcc_preview">–</strong> lux·min</span>
+      </div>
+      <div class="form-row corr-reason-row">
+        <label>更正理由</label>
+        <textarea id="rcc_reason" maxlength="500" rows="2" placeholder="例如：照度计复核、搬运记录补录…（必填）"></textarea>
+      </div>
+      <div class="form-error hidden" id="rcc_error"></div>
+      <div class="modal-actions">
+        <button class="btn" data-close>取消</button>
+        <button class="btn btn-primary" id="rcc_save">提交更正</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 计划外记录作废弹窗 -->
+  <div class="modal-mask hidden" id="recVoidModal">
+    <div class="modal">
+      <h3>作废计划外记录</h3>
+      <div class="corr-range" id="rv_range"></div>
+      <p class="void-tip">作废后记录将归档保留（含本理由与作废前后值），不再计入作品与额度组已用，并按现有时序重算未开始时段；作废不可撤销。</p>
+      <div class="form-row corr-reason-row">
+        <label>作废理由</label>
+        <textarea id="rv_reason" maxlength="500" rows="3" placeholder="必填：如误录、重复登记、复核非作品受光…"></textarea>
+      </div>
+      <div class="form-error hidden" id="rv_error"></div>
+      <div class="modal-actions">
+        <button class="btn" data-close>取消</button>
+        <button class="btn btn-danger" id="rv_save">确认作废</button>
       </div>
     </div>
   </div>

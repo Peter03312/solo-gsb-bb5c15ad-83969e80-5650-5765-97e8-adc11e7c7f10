@@ -89,6 +89,47 @@ CREATE TABLE IF NOT EXISTS quota_group_members (
   PRIMARY KEY (group_id, artwork_id)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_quota_group_members_artwork ON quota_group_members(artwork_id);
+
+-- 计划外曝光记录：布展 / 搬运等排期外受光。单件作品 + 实际起止 + 连续照度分段。
+-- status: active 有效（计入已用量）/ void 已作废（归档保留、不再计入）
+-- 更正只改照度分段（区间沿用），作废后记录只读；每次变动写 exposure_record_changes。
+CREATE TABLE IF NOT EXISTS exposure_records (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  artwork_id INTEGER NOT NULL REFERENCES artworks(id) ON DELETE CASCADE,
+  status TEXT NOT NULL DEFAULT 'active',
+  -- 事由（布展 / 搬运 / 其他）与备注
+  reason_kind TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT '',
+  actual_start TEXT NOT NULL,
+  actual_end TEXT NOT NULL,
+  actual_lux REAL,                       -- 仅单段时为该段照度，多段为 NULL
+  actual_minutes INTEGER NOT NULL,
+  actual_exposure REAL NOT NULL CHECK (actual_exposure >= 0),
+  -- 连续照度分段 JSON：[{start,end,lux,minutes,exposure}]，首尾衔接、完整覆盖实际区间
+  actual_segments TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_exposure_records_artwork ON exposure_records(artwork_id);
+
+-- 计划外记录的更正 / 作废审计（只增不改：每次变动写一条，保留前后值与理由）
+-- change_type: correct 更正分段 / void 作废
+CREATE TABLE IF NOT EXISTS exposure_record_changes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  record_id INTEGER NOT NULL REFERENCES exposure_records(id) ON DELETE CASCADE,
+  change_type TEXT NOT NULL,
+  seq_no INTEGER NOT NULL,               -- 该记录第几次变动（从 1 开始，更正/作废连续编号）
+  reason TEXT NOT NULL,
+  before_status TEXT NOT NULL,
+  before_start TEXT NOT NULL, before_end TEXT NOT NULL,
+  before_lux REAL, before_minutes INTEGER NOT NULL, before_exposure REAL NOT NULL,
+  before_segments TEXT NOT NULL DEFAULT '[]',
+  after_status TEXT NOT NULL,
+  after_start TEXT NOT NULL, after_end TEXT NOT NULL,
+  after_lux REAL, after_minutes INTEGER NOT NULL, after_exposure REAL NOT NULL,
+  after_segments TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_exposure_record_changes_record ON exposure_record_changes(record_id, seq_no, id);
 `;
 
 // 旧库升级：为已存在的 slots 表补齐多段结算列

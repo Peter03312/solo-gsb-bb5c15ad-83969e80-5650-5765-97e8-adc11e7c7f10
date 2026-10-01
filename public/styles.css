@@ -104,6 +104,15 @@ main { padding: 22px 28px 60px; max-width: 1500px; margin: 0 auto; }
 .badge-finished { background: var(--ok-bg); color: var(--ok); border: 1px solid #bfe5cd; }
 .badge-scheduled { background: #eef3f9; color: var(--primary); border: 1px solid #cfe0f0; }
 .badge-blocked { background: var(--blocked-bg); color: var(--blocked); border: 1px solid #f0bcb5; }
+.badge-record { background: #eef2ff; color: #3730a3; border: 1px solid #c7d2fe; }
+.badge-void { background: #f1f3f6; color: var(--muted); border: 1px solid #dde3ea; }
+.void-row { opacity: .62; }
+.void-row .art-name { text-decoration: line-through; }
+.rec-filter { padding: 6px 9px; font-size: 12.5px; }
+.void-tip {
+  background: var(--danger-bg); border: 1px solid #ecc4be; color: var(--danger);
+  border-radius: 8px; padding: 9px 12px; font-size: 12.5px; margin-bottom: 12px;
+}
 
 .art-name { font-weight: 600; }
 .note-text { color: var(--muted); font-size: 12.5px; max-width: 160px; }
