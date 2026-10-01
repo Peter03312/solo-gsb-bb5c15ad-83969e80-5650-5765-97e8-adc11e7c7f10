@@ -75,6 +75,41 @@ CREATE TABLE IF NOT EXISTS slot_artworks (
   PRIMARY KEY (slot_id, artwork_id)
 );
 
+-- 计划外曝光记录：布展 / 搬运等排期外受光的归档记录（一件作品 + 实际起止 + 连续照度分段）
+-- status: active 有效（计入已用量、参与重叠校验）/ voided 已作废（保留归档，不再计入）
+CREATE TABLE IF NOT EXISTS exposure_records (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  artwork_id INTEGER NOT NULL REFERENCES artworks(id) ON DELETE CASCADE,
+  start_time TEXT NOT NULL,             -- 实际区间开始（归档后不再改变，更正沿用原区间）
+  end_time TEXT NOT NULL,               -- 实际区间结束（须为正时长）
+  lux REAL,                             -- 单段照度；多段为 NULL（以 segments 为准）
+  minutes INTEGER NOT NULL,
+  exposure REAL NOT NULL,
+  segments TEXT NOT NULL DEFAULT '[]',  -- JSON [{start,end,lux,minutes,exposure}]，首尾衔接完整覆盖区间
+  status TEXT NOT NULL DEFAULT 'active',
+  created_at TEXT NOT NULL
+);
+
+-- 计划外曝光记录的变动历史（只增不改）：每次更正分段 / 作废写一条，保留前后值与理由
+CREATE TABLE IF NOT EXISTS exposure_record_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  record_id INTEGER NOT NULL REFERENCES exposure_records(id) ON DELETE CASCADE,
+  seq_no INTEGER NOT NULL,              -- 该记录第几次变动（从 1 开始）
+  action TEXT NOT NULL,                 -- correct 更正分段 / void 作废
+  reason TEXT NOT NULL,
+  before_status TEXT NOT NULL,
+  before_lux REAL,
+  before_minutes INTEGER,
+  before_exposure REAL,
+  before_segments TEXT NOT NULL DEFAULT '[]',
+  after_status TEXT NOT NULL,
+  after_lux REAL,
+  after_minutes INTEGER,
+  after_exposure REAL,
+  after_segments TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL
+);
+
 -- 曝光额度组：巡展中易损作品共用一笔曝光额度（名称 + 非负上限）
 CREATE TABLE IF NOT EXISTS quota_groups (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

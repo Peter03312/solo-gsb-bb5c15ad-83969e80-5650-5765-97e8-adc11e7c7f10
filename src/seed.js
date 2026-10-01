@@ -1,7 +1,8 @@
 'use strict';
 const { recomputeBlocked } = require('./budget');
 
-// 以 2026-09-30 为“今天”的演示数据：含已结束 / 进行中（冻结）/ 未开始时段。
+// 以 2026-09-30 为“今天”的演示数据：含已结束 / 进行中（冻结）/ 未开始时段、
+// 一个曝光额度组，以及两条计划外曝光记录（一条有效带更正、一条已作废）。
 // 初始数据满足全部预算约束。
 // 演示超量：在页面把进行中时段（一号厅 09:00–13:00）以更高实际照度结束，
 // 例如实际照度 300 lux（240 分钟 = 72000 lux·min），
@@ -98,6 +99,48 @@ function seed(db) {
   const insMem = db.prepare('INSERT INTO quota_group_members (group_id, artwork_id) VALUES (?, ?)');
   insMem.run(g1, artIds.w1);
   insMem.run(g1, artIds.w2);
+
+  // 计划外曝光演示：布展 / 搬运途中受光的归档记录（《青铜纹样》摄影，排期外）
+  const insRec = db.prepare(`
+    INSERT INTO exposure_records (artwork_id, start_time, end_time, lux, minutes, exposure, segments, status, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const insRecEvt = db.prepare(`
+    INSERT INTO exposure_record_events (
+      record_id, seq_no, action, reason,
+      before_status, before_lux, before_minutes, before_exposure, before_segments,
+      after_status, after_lux, after_minutes, after_exposure, after_segments,
+      created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  // R1（有效）：布展期间受光，最初按单一 200 lux 登记（18000），后按实测更正为两段（17100）
+  const r1Segs = [
+    { start: '2026-09-28T15:00', end: '2026-09-28T15:45', lux: 300, minutes: 45, exposure: 13500 },
+    { start: '2026-09-28T15:45', end: '2026-09-28T16:30', lux: 80, minutes: 45, exposure: 3600 },
+  ];
+  const r1 = insRec.run(
+    artIds.w3, '2026-09-28T15:00', '2026-09-28T16:30', null, 90, 17100,
+    JSON.stringify(r1Segs), 'active', '2026-09-28T17:10',
+  ).lastInsertRowid;
+  insRecEvt.run(
+    r1, 1, 'correct', '布展照明实测复核：搭建阶段 300 lux，作品就位后降至 80 lux，按分段补登',
+    'active', 200, 90, 18000,
+    JSON.stringify([{ start: '2026-09-28T15:00', end: '2026-09-28T16:30', lux: 200, minutes: 90, exposure: 18000 }]),
+    'active', null, 90, 17100, JSON.stringify(r1Segs),
+    '2026-09-28T18:02',
+  );
+  // R2（已作废）：搬运途中疑似受光，复核确认为记录仪误报
+  const r2Segs = [{ start: '2026-09-27T10:00', end: '2026-09-27T10:30', lux: 500, minutes: 30, exposure: 15000 }];
+  const r2 = insRec.run(
+    artIds.w3, '2026-09-27T10:00', '2026-09-27T10:30', 500, 30, 15000,
+    JSON.stringify(r2Segs), 'voided', '2026-09-27T11:00',
+  ).lastInsertRowid;
+  insRecEvt.run(
+    r2, 1, 'void', '复核确认搬运全程处于避光箱内，记录仪数据为误报，予以作废',
+    'active', 500, 30, 15000, JSON.stringify(r2Segs),
+    'voided', 500, 30, 15000, JSON.stringify(r2Segs),
+    '2026-09-27T14:20',
+  );
 
   const tx = db.transaction(() => recomputeBlocked(db));
   tx.immediate();

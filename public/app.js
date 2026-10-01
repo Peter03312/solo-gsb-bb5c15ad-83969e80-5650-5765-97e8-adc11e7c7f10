@@ -1,16 +1,21 @@
 'use strict';
 
 const $ = (sel) => document.querySelector(sel);
-let state = { version: null, artworks: [], groups: [], slots: [] };
+let state = { version: null, artworks: [], groups: [], slots: [], exposureRecords: [] };
 let draft = [];          // 未开始时段草稿
 let draftSeq = 0;        // 草稿行本地序号
 let editingArtworkId = null;
 let editingGroupId = null;
 let finishingSlotId = null;
 let correctingSlotId = null;
+let correctingRecordId = null; // 正在更正分段的计划外记录
+let voidingRecordId = null;    // 正在作废的计划外记录
 let fnSegments = [];     // 结束弹窗分段编辑数据
 let crSegments = [];     // 更正弹窗分段编辑数据
+let erSegments = [];     // 计划外录入弹窗分段编辑数据
+let rcSegments = [];     // 计划外更正弹窗分段编辑数据
 const expandedSlots = new Set(); // 展开分段/更正记录的已结束时段
+const expandedRecords = new Set(); // 展开分段/变动历史的计划外记录
 
 // ---------- 工具 ----------
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => (
@@ -99,7 +104,7 @@ function renderArtworks() {
       <td class="art-name">${esc(a.name)}</td>
       <td class="num">${fmt(a.limit)}</td>
       <td class="num">${fmt(a.existing)}</td>
-      <td class="num">${fmt(a.used)}</td>
+      <td class="num">${fmt(a.used)}${a.unplanned ? `<span class="reserved-detail">含计划外 ${fmt(a.unplanned)}</span>` : ''}</td>
       <td class="num">${fmt(a.reserved)}<span class="reserved-detail">${fmt(a.reservedRunning)} / ${fmt(a.reservedScheduled)}</span></td>
       <td class="num">${fmt(a.committed)}</td>
       <td class="num ${a.over ? 'neg' : 'pos'}">${a.over ? '−' + fmt(Math.abs(a.balance)) : fmt(a.balance)}</td>
@@ -130,7 +135,7 @@ function renderGroups() {
         ? g.members.map((m) => `<span class="chip">${esc(m.name)}</span>`).join('')
         : '<span style="color:var(--muted);font-size:12px">暂无成员</span>'}</div></td>
       <td class="num">${fmt(g.limit)}</td>
-      <td class="num">${fmt(g.used)}</td>
+      <td class="num">${fmt(g.used)}${g.unplanned ? `<span class="reserved-detail">含计划外 ${fmt(g.unplanned)}</span>` : ''}</td>
       <td class="num">${fmt(g.reserved)}<span class="reserved-detail">${fmt(g.reservedRunning)} / ${fmt(g.reservedScheduled)}</span></td>
       <td class="num">${fmt(g.committed)}</td>
       <td class="num ${g.over ? 'neg' : 'pos'}">${g.over ? '−' + fmt(Math.abs(g.balance)) : fmt(g.balance)}</td>
@@ -282,10 +287,80 @@ function renderDraft() {
   }).join('');
 }
 
+// ---------- 渲染：计划外曝光记录 ----------
+function recordEventList(r) {
+  if (!r.events || !r.events.length) return '';
+  const items = r.events.map((ev) => {
+    const isVoid = ev.action === 'void';
+    const nums = isVoid
+      ? `状态 有效 <span class="arrow">→</span> 已作废 ｜ 曝光 ${fmt(ev.before.exposure)} lux·min 不再计入已用量`
+      : `曝光 ${fmt(ev.before.exposure)} <span class="arrow">→</span> ${fmt(ev.after.exposure)} lux·min
+         ｜ 时长 ${ev.before.minutes} <span class="arrow">→</span> ${ev.after.minutes} 分
+         ｜ 分段 ${ev.before.segments.length} <span class="arrow">→</span> ${ev.after.segments.length} 段`;
+    return `
+    <div class="corr-item">
+      <div class="corr-head"><span>第 ${ev.seqNo} 次变动 · ${isVoid ? '作废' : '更正分段'}</span><span>${esc(ev.createdAt)}</span></div>
+      <div class="corr-reason">理由：${esc(ev.reason)}</div>
+      <div class="corr-nums">${nums}</div>
+      ${isVoid ? '' : `<div>${segPills({ actualSegments: ev.after.segments })}</div>`}
+    </div>`;
+  }).join('');
+  return `<div class="detail-block"><div class="detail-title">变动记录（${r.events.length}）</div>${items}</div>`;
+}
+function renderRecords() {
+  const tb = $('#recordTable tbody');
+  const rows = state.exposureRecords || [];
+  if (!rows.length) {
+    tb.innerHTML = '<tr class="empty-row"><td colspan="9">暂无计划外曝光记录，点击「录入计划外曝光」归档布展 / 搬运中的受光</td></tr>';
+    return;
+  }
+  tb.innerHTML = rows.map((r) => {
+    const luxCell = r.lux === null
+      ? `多段<span class="multi-lux-hint">${r.segmentCount} 段照度</span>`
+      : fmt(r.lux);
+    const statusBadge = r.status === 'active'
+      ? '<span class="badge badge-finished">有效</span>'
+      : '<span class="badge badge-voided">已作废</span>';
+    const toggleBtn = `<button class="btn btn-sm" data-act="toggle-rec" data-id="${r.id}">${expandedRecords.has(r.id) ? '收起明细' : '分段/变动'}</button>`;
+    const actions = r.status === 'active'
+      ? `<div class="row-actions">${toggleBtn}
+           <button class="btn btn-sm" data-act="correct-rec" data-id="${r.id}">分段更正</button>
+           <button class="btn btn-sm btn-danger" data-act="void-rec" data-id="${r.id}">作废</button>
+         </div>`
+      : `<div class="row-actions">${toggleBtn}</div>`;
+    const detailRow = expandedRecords.has(r.id) ? `
+      <tr class="detail-row">
+        <td colspan="9"><div class="detail-inner">
+          <div class="detail-block">
+            <div class="detail-title">照度分段（${r.segmentCount}）</div>
+            ${segPills({ actualSegments: r.segments }) || '<span style="color:var(--muted);font-size:12px">无分段数据</span>'}
+          </div>
+          ${recordEventList(r)}
+        </div></td>
+      </tr>` : '';
+    return `
+    <tr class="${r.status === 'voided' ? 'rec-voided' : ''}">
+      <td>${r.id}</td>
+      <td class="art-name">${esc(r.artworkName)}</td>
+      <td class="mono" style="font-family:var(--mono);font-size:12.5px;white-space:nowrap">
+        ${esc(r.start)}<br>～ ${esc(r.end)}
+      </td>
+      <td class="num">${luxCell}</td>
+      <td class="num">${r.minutes}</td>
+      <td class="num">${fmt(r.exposure)}</td>
+      <td>${statusBadge}</td>
+      <td class="mono" style="font-family:var(--mono);font-size:12.5px">${esc(r.createdAt)}</td>
+      <td>${actions}</td>
+    </tr>
+    ${detailRow}`;
+  }).join('');
+}
+
 function renderAll() {
   renderArtworks();
   renderGroups();
   renderFrozen();
+  renderRecords();
   renderDraft();
 }
 
@@ -344,7 +419,12 @@ function formatBatchError(payload) {
   const lines = [];
   (payload.errors || []).forEach((x) => lines.push(`• ${x.message}`));
   (payload.conflicts || []).forEach((c) => {
-    lines.push(`• 作品「${c.artworkName}」时段重叠：\n    ${c.slotA.label}\n    ${c.slotB.label}`);
+    const head = c.kind === 'new-record'
+      ? `• 作品「${c.artworkName}」排期覆盖有效计划外曝光记录：`
+      : c.kind === 'new-frozen'
+        ? `• 作品「${c.artworkName}」与冻结时段重叠：`
+        : `• 作品「${c.artworkName}」时段重叠：`;
+    lines.push(`${head}\n    ${c.slotA.label}\n    ${c.slotB.label}`);
   });
   (payload.budgetExceeded || []).forEach((b) => {
     lines.push(`• 作品「${b.artworkName}」预算超限：已用 ${fmt(b.used)} + 预占 = ${fmt(b.projected)}，上限 ${fmt(b.limit)}，超出 ${fmt(b.overflow)} lux·min`);
@@ -655,6 +735,177 @@ $('#cr_save').addEventListener('click', async () => {
       ? err.payload.segmentErrors.map((x) => `• ${x}`).join('\n')
       : err.message;
     $('#cr_error').classList.remove('hidden');
+  }
+});
+
+// ---------- 计划外曝光记录：录入 / 更正 / 作废 ----------
+function recordErrorText(payload, fallback) {
+  const lines = [];
+  (payload.segmentErrors || []).forEach((x) => lines.push(`• ${x}`));
+  (payload.conflicts || []).forEach((c) => lines.push(`• 与${c.kind === 'slot' ? '时段' : '有效记录'}冲突：${c.label}`));
+  return lines.join('\n') || fallback;
+}
+function toastRecordResult(next, head) {
+  if (next.blockedAfterRecord && next.blockedAfterRecord.length) {
+    const detail = next.blockedAfterRecord.map((s) =>
+      `#${s.seq} ${s.hall} ${s.plannedStart}~${s.plannedEnd}：${gapText(s.blockedReason)}`).join('\n');
+    toast('warn', `${head}\n按现有顺序重算后，以下未开始时段预算不足、不可启动：\n${detail}`);
+  } else {
+    toast('success', `${head}，已用量与后续可启动状态已同步重算`);
+  }
+}
+
+$('#addRecordBtn').addEventListener('click', () => {
+  if (!state.artworks.length) return toast('warn', '请先录入至少一件作品');
+  $('#er_artwork').innerHTML = state.artworks
+    .map((a) => `<option value="${a.id}">${esc(a.name)}</option>`).join('');
+  $('#er_start').value = '';
+  $('#er_end').value = '';
+  erSegments = [{ start: '', end: '', lux: '' }];
+  renderSegList($('#er_segments'), erSegments, 'er');
+  $('#er_error').classList.add('hidden');
+  updateRecordPreview();
+  $('#recordModal').classList.remove('hidden');
+});
+function updateRecordPreview() {
+  refreshSegLabels($('#er_segments'), erSegments);
+  const t = segTotals(erSegments);
+  $('#er_preview').textContent = t.valid ? fmt(t.exposure) : '–';
+  $('#er_totalMins').textContent = t.valid ? t.totalMins : '–';
+}
+bindSegEditor('er_segments', 'er_addSeg', () => erSegments, updateRecordPreview);
+// 区间变化时，若只有一段则同步该段起止，便于快速录入单段记录
+['er_start', 'er_end'].forEach((id) => $('#' + id).addEventListener('change', () => {
+  if (erSegments.length === 1) {
+    erSegments[0].start = $('#er_start').value;
+    erSegments[0].end = $('#er_end').value;
+    renderSegList($('#er_segments'), erSegments, 'er');
+  }
+  updateRecordPreview();
+}));
+
+$('#er_save').addEventListener('click', async () => {
+  syncSegFromDom($('#er_segments'), erSegments);
+  try {
+    const next = await api('/api/exposure-records', {
+      method: 'POST',
+      body: {
+        version: state.version,
+        artworkId: Number($('#er_artwork').value),
+        start: $('#er_start').value,
+        end: $('#er_end').value,
+        segments: erSegments.map((g) => ({ start: g.start, end: g.end, lux: g.lux === '' ? null : Number(g.lux) })),
+      },
+    });
+    $('#recordModal').classList.add('hidden');
+    applyNewState(next);
+    expandedRecords.add(next.record.id);
+    renderRecords();
+    toastRecordResult(next,
+      `已归档计划外曝光 #${next.record.id}：${fmt(next.record.exposure)} lux·min 计入「${next.record.artworkName}」已用量`);
+  } catch (err) {
+    if (err.status === 409) {
+      $('#recordModal').classList.add('hidden');
+      return handleMutationError(err);
+    }
+    $('#er_error').textContent = recordErrorText(err.payload || {}, err.message);
+    $('#er_error').classList.remove('hidden');
+  }
+});
+
+$('#recordTable').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-act]');
+  if (!btn) return;
+  const id = Number(btn.dataset.id);
+  const rec = (state.exposureRecords || []).find((r) => r.id === id);
+  if (!rec) return;
+  const act = btn.dataset.act;
+  if (act === 'toggle-rec') {
+    if (expandedRecords.has(id)) expandedRecords.delete(id); else expandedRecords.add(id);
+    renderRecords();
+  }
+  if (act === 'correct-rec') openRecCorrectModal(rec);
+  if (act === 'void-rec') openRecVoidModal(rec);
+});
+
+// 分段更正（沿用原区间）
+function openRecCorrectModal(rec) {
+  correctingRecordId = rec.id;
+  rcSegments = (rec.segments && rec.segments.length
+    ? rec.segments
+    : [{ start: rec.start, end: rec.end, lux: rec.lux ?? '' }]
+  ).map((g) => ({ start: g.start, end: g.end, lux: g.lux }));
+  $('#rc_range').innerHTML = `作品 <strong>${esc(rec.artworkName)}</strong> ｜ 原实际区间 <strong>${esc(rec.start)}</strong> ～ <strong>${esc(rec.end)}</strong>`
+    + `（共 ${rec.minutes} 分）｜更正前曝光 <strong>${fmt(rec.exposure)}</strong> lux·min`;
+  $('#rc_beforeExpo').textContent = fmt(rec.exposure);
+  $('#rc_reason').value = '';
+  $('#rc_error').classList.add('hidden');
+  renderSegList($('#rc_segments'), rcSegments, 'rc');
+  updateRecCorrectPreview();
+  $('#recCorrectModal').classList.remove('hidden');
+}
+function updateRecCorrectPreview() {
+  syncSegFromDom($('#rc_segments'), rcSegments);
+  const t = segTotals(rcSegments);
+  $('#rc_preview').textContent = t.valid ? fmt(t.exposure) : '–';
+  $('#rc_totalMins').textContent = t.valid ? t.totalMins : '–';
+}
+bindSegEditor('rc_segments', 'rc_addSeg', () => rcSegments, updateRecCorrectPreview);
+
+$('#rc_save').addEventListener('click', async () => {
+  syncSegFromDom($('#rc_segments'), rcSegments);
+  try {
+    const next = await api(`/api/exposure-records/${correctingRecordId}/correct`, {
+      method: 'POST',
+      body: {
+        version: state.version,
+        reason: $('#rc_reason').value.trim(),
+        segments: rcSegments.map((g) => ({ start: g.start, end: g.end, lux: g.lux === '' ? null : Number(g.lux) })),
+      },
+    });
+    $('#recCorrectModal').classList.add('hidden');
+    applyNewState(next);
+    expandedRecords.add(correctingRecordId);
+    renderRecords();
+    const ev = next.recordEvent;
+    toastRecordResult(next, `已提交第 ${ev.seqNo} 次更正：曝光 ${fmt(ev.before.exposure)} → ${fmt(ev.after.exposure)} lux·min（沿用原区间）`);
+  } catch (err) {
+    if (err.status === 409) {
+      $('#recCorrectModal').classList.add('hidden');
+      return handleMutationError(err);
+    }
+    $('#rc_error').textContent = recordErrorText(err.payload || {}, err.message);
+    $('#rc_error').classList.remove('hidden');
+  }
+});
+
+// 作废
+function openRecVoidModal(rec) {
+  voidingRecordId = rec.id;
+  $('#rv_info').innerHTML = `记录 <strong>#${rec.id}</strong> ｜ ${esc(rec.artworkName)}<br>`
+    + `${esc(rec.start)} ～ ${esc(rec.end)} ｜ 曝光 <strong>${fmt(rec.exposure)}</strong> lux·min`;
+  $('#rv_reason').value = '';
+  $('#rv_error').classList.add('hidden');
+  $('#recVoidModal').classList.remove('hidden');
+}
+$('#rv_save').addEventListener('click', async () => {
+  try {
+    const next = await api(`/api/exposure-records/${voidingRecordId}/void`, {
+      method: 'POST',
+      body: { version: state.version, reason: $('#rv_reason').value.trim() },
+    });
+    $('#recVoidModal').classList.add('hidden');
+    applyNewState(next);
+    expandedRecords.add(voidingRecordId);
+    renderRecords();
+    toastRecordResult(next, `记录 #${voidingRecordId} 已作废：${fmt(next.record.exposure)} lux·min 不再计入已用量`);
+  } catch (err) {
+    if (err.status === 409) {
+      $('#recVoidModal').classList.add('hidden');
+      return handleMutationError(err);
+    }
+    $('#rv_error').textContent = recordErrorText(err.payload || {}, err.message);
+    $('#rv_error').classList.remove('hidden');
   }
 });
 

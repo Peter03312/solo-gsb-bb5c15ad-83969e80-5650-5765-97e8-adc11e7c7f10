@@ -104,6 +104,9 @@ main { padding: 22px 28px 60px; max-width: 1500px; margin: 0 auto; }
 .badge-finished { background: var(--ok-bg); color: var(--ok); border: 1px solid #bfe5cd; }
 .badge-scheduled { background: #eef3f9; color: var(--primary); border: 1px solid #cfe0f0; }
 .badge-blocked { background: var(--blocked-bg); color: var(--blocked); border: 1px solid #f0bcb5; }
+.badge-voided { background: #f1f3f5; color: var(--muted); border: 1px solid #dde2e8; }
+.rec-voided td { color: var(--muted); }
+.rec-voided .art-name { color: var(--muted); font-weight: 500; }
 
 .art-name { font-weight: 600; }
 .note-text { color: var(--muted); font-size: 12.5px; max-width: 160px; }

@@ -518,6 +518,175 @@ const getState = async () => (await call('GET', '/api/state')).json;
   r = await call('DELETE', `/api/artworks/${artB}`, { version: v });
   ok(r.status === 200, '联展测试数据已清理');
 
+  console.log('# 24. 计划外曝光记录：演示数据与已用量口径');
+  st = await getState();
+  v = st.version;
+  ok(Array.isArray(st.exposureRecords) && st.exposureRecords.length === 2
+     && st.exposureRecords.some((x) => x.status === 'voided')
+     && st.exposureRecords.find((x) => x.status === 'active').events.length === 1,
+     '演示数据自带计划外曝光记录（1 条有效带更正历史 + 1 条已作废）');
+  const w3rec = st.artworks.find((a) => a.id === 3);
+  ok(w3rec.unplanned === 17100 && w3rec.used === 47100,
+     `有效记录计入作品已用量（计划外 ${w3rec.unplanned}，已用 ${w3rec.used}，作废不计入）`);
+
+  console.log('# 25. 录入校验：区间正时长 / 分段衔接覆盖 / 非负照度 / 作品存在 / 版本');
+  r = await call('POST', '/api/artworks', { version: v, name: '计划外测试品', limit: 10000, existing: 0 });
+  ok(r.status === 200, '计划外测试作品已创建（上限 10000）');
+  const recArt = r.json.artworks.at(-1).id;
+  v = r.json.version;
+  r = await call('POST', '/api/schedule', { version: v, slots: [
+    { cid: 'rs1', hall: '八号厅', start: '2027-01-10T10:00', end: '2027-01-10T11:00', lux: 100, artworkIds: [recArt] },
+  ]});
+  ok(r.status === 200, '测试时段 S1 已排期（60 分 × 100 = 6000）');
+  v = r.json.version;
+  const rs1 = r.json.slots.find((s) => s.hall === '八号厅');
+  ok(!rs1.blocked, '录入记录前 S1 可启动');
+
+  const mkRec = (over) => ({ version: v, artworkId: recArt, start: '2027-01-05T09:00', end: '2027-01-05T10:00', ...over });
+  r = await call('POST', '/api/exposure-records', mkRec({
+    start: '2027-01-05T09:00', end: '2027-01-05T09:00',
+    segments: [{ start: '2027-01-05T09:00', end: '2027-01-05T09:00', lux: 100 }],
+  }));
+  ok(r.status === 422, '零时长区间被拒绝（区间须为正时长）');
+  r = await call('POST', '/api/exposure-records', mkRec({ segments: [
+    { start: '2027-01-05T09:00', end: '2027-01-05T09:30', lux: 100 },
+    { start: '2027-01-05T09:40', end: '2027-01-05T10:00', lux: 100 },
+  ]}));
+  ok(r.status === 422 && r.json.error.code === 'SEGMENTS_INVALID', '分段有缺口被拒绝');
+  r = await call('POST', '/api/exposure-records', mkRec({ segments: [
+    { start: '2027-01-05T09:00', end: '2027-01-05T10:00', lux: -1 },
+  ]}));
+  ok(r.status === 422, '分段负照度被拒绝');
+  r = await call('POST', '/api/exposure-records', mkRec({ artworkId: 999999, segments: [
+    { start: '2027-01-05T09:00', end: '2027-01-05T10:00', lux: 100 },
+  ]}));
+  ok(r.status === 422, '作品不存在被拒绝');
+  r = await call('POST', '/api/exposure-records', mkRec({ version: 1, segments: [
+    { start: '2027-01-05T09:00', end: '2027-01-05T10:00', lux: 100 },
+  ]}));
+  ok(r.status === 409 && r.json.error.code === 'VERSION_STALE' && r.json.state.version === v,
+     '过期版本返回 409 与最新预算');
+  st = await getState();
+  ok(st.version === v && st.exposureRecords.filter((x) => x.artworkId === recArt).length === 0,
+     '校验失败不改变记录、预算与版本');
+
+  console.log('# 26. 录入成功：计入已用、余额可为负、后续时段按顺序重算阻断');
+  r = await call('POST', '/api/exposure-records', mkRec({ segments: [
+    { start: '2027-01-05T09:00', end: '2027-01-05T09:30', lux: 100 },
+    { start: '2027-01-05T09:30', end: '2027-01-05T10:00', lux: 200 },
+  ]}));
+  ok(r.status === 200 && r.json.record.exposure === 9000 && r.json.record.minutes === 60
+     && r.json.record.segmentCount === 2 && r.json.record.status === 'active',
+     `记录已归档（曝光 ${r.json.record?.exposure} = 30×100 + 30×200）`);
+  v = r.json.version;
+  const rec1 = r.json.record;
+  const recArtNow = r.json.artworks.find((a) => a.id === recArt);
+  ok(recArtNow.used === 9000 && recArtNow.unplanned === 9000
+     && recArtNow.balance === -5000 && recArtNow.over === true,
+     `历史实耗使余额为负（已用 ${recArtNow.used}，余额 ${recArtNow.balance}）`);
+  const rs1b = r.json.slots.find((s) => s.id === rs1.id);
+  ok(rs1b.blocked && rs1b.blockedReason.gaps[0].has === 1000
+     && rs1b.blockedReason.gaps[0].need === 6000 && rs1b.blockedReason.gaps[0].gap === 5000,
+     'S1 按现有顺序重算为不可启动并给出缺口（has 1000 / need 6000 / gap 5000）');
+  ok(r.json.blockedAfterRecord.some((s) => s.id === rs1.id), '响应携带受影响的不可启动时段');
+  r = await call('POST', `/api/slots/${rs1.id}/start`);
+  ok(r.status === 422 && r.json.error.code === 'BLOCKED', '缺口时段禁止启动');
+
+  console.log('# 27. 重叠：记录 vs 时段 / 记录 vs 记录 / 排期不得覆盖有效记录');
+  r = await call('POST', '/api/exposure-records', { version: v, artworkId: recArt,
+    start: '2027-01-10T10:30', end: '2027-01-10T11:30',
+    segments: [{ start: '2027-01-10T10:30', end: '2027-01-10T11:30', lux: 50 }] });
+  ok(r.status === 422 && r.json.error.code === 'OVERLAP_CONFLICT'
+     && r.json.conflicts[0].kind === 'slot' && r.json.conflicts[0].slot.id === rs1.id,
+     '与已有时段重叠被拒，指出时段与区间');
+  r = await call('POST', '/api/exposure-records', { version: v, artworkId: recArt,
+    start: '2027-01-05T09:30', end: '2027-01-05T10:30',
+    segments: [{ start: '2027-01-05T09:30', end: '2027-01-05T10:30', lux: 50 }] });
+  ok(r.status === 422 && r.json.conflicts[0].kind === 'record' && r.json.conflicts[0].record.id === rec1.id,
+     '与其他有效记录重叠被拒，指出记录与区间');
+  r = await call('POST', '/api/schedule', { version: v, slots: [
+    { cid: 'cover', hall: '八号厅', start: '2027-01-05T08:00', end: '2027-01-05T12:00', lux: 10, artworkIds: [recArt] },
+  ]});
+  ok(r.status === 422 && r.json.conflicts?.[0]?.kind === 'new-record'
+     && r.json.conflicts[0].slotB.cid === `record#${rec1.id}`,
+     '后续排期不得覆盖有效记录（整批拒绝并指出记录）');
+  st = await getState();
+  ok(st.version === v && st.exposureRecords.filter((x) => x.artworkId === recArt).length === 1,
+     '冲突失败不改变记录与版本');
+
+  console.log('# 28. 记录更正：理由必填 / 沿用原区间 / 替换语义 / 同步重算');
+  const recCorrectPath = `/api/exposure-records/${rec1.id}/correct`;
+  r = await call('POST', recCorrectPath, { version: v, segments: [
+    { start: '2027-01-05T09:00', end: '2027-01-05T10:00', lux: 50 },
+  ]});
+  ok(r.status === 422, '无理由更正被拒绝');
+  r = await call('POST', recCorrectPath, { version: v, reason: 'x', segments: [
+    { start: '2027-01-05T09:00', end: '2027-01-05T09:30', lux: 50 },
+  ]});
+  ok(r.status === 422 && r.json.error.code === 'SEGMENTS_INVALID', '更正分段未覆盖原区间被拒绝');
+  r = await call('POST', recCorrectPath, { version: 1, reason: 'x', segments: [
+    { start: '2027-01-05T09:00', end: '2027-01-05T10:00', lux: 50 },
+  ]});
+  ok(r.status === 409 && r.json.state.version === v, '更正过期版本返回 409 与最新预算');
+  r = await call('POST', recCorrectPath, { version: v, reason: '照度计复核：全程实际 50 lux', segments: [
+    { start: '2027-01-05T09:00', end: '2027-01-05T10:00', lux: 50 },
+  ]});
+  ok(r.status === 200 && r.json.recordEvent.action === 'correct'
+     && r.json.recordEvent.before.exposure === 9000 && r.json.recordEvent.after.exposure === 3000
+     && r.json.record.exposure === 3000 && r.json.record.start === '2027-01-05T09:00',
+     '更正成功：9000→3000，沿用原区间');
+  v = r.json.version;
+  ok(r.json.artworks.find((a) => a.id === recArt).used === 3000, '新总量替换旧总量（已用 3000，不重复累计）');
+  ok(!r.json.slots.find((s) => s.id === rs1.id).blocked, '更正后缺口消除，S1 恢复可启动');
+  st = await getState();
+  const rec1Dto = st.exposureRecords.find((x) => x.id === rec1.id);
+  ok(rec1Dto.events.length === 1 && rec1Dto.events[0].reason.includes('照度计复核')
+     && rec1Dto.events[0].before.segments.length === 2 && rec1Dto.events[0].after.segments.length === 1,
+     '变动历史保留前后值与理由（只增不改）');
+
+  console.log('# 29. 记录作废：带理由、同步重算、作废后不再参与重叠校验');
+  const recVoidPath = `/api/exposure-records/${rec1.id}/void`;
+  r = await call('POST', recVoidPath, { version: v });
+  ok(r.status === 422, '无理由作废被拒绝');
+  r = await call('POST', recVoidPath, { version: v, reason: '复核为其他作品的记录，录入对象错误' });
+  ok(r.status === 200 && r.json.record.status === 'voided' && r.json.recordEvent.action === 'void'
+     && r.json.recordEvent.before.status === 'active' && r.json.recordEvent.after.status === 'voided',
+     '作废成功并记录状态前后值');
+  v = r.json.version;
+  ok(r.json.artworks.find((a) => a.id === recArt).used === 0, '作废后已用量同步重算为 0');
+  r = await call('POST', recCorrectPath, { version: v, reason: 'x', segments: [
+    { start: '2027-01-05T09:00', end: '2027-01-05T10:00', lux: 50 },
+  ]});
+  ok(r.status === 422 && r.json.error.code === 'RECORD_VOIDED', '已作废记录不可再更正');
+  r = await call('POST', recVoidPath, { version: v, reason: 'x' });
+  ok(r.status === 422 && r.json.error.code === 'RECORD_VOIDED', '重复作废被拒绝');
+  st = await getState();
+  ok(st.version === v, '失败操作不改变版本与记录');
+  r = await call('POST', '/api/exposure-records', mkRec({ segments: [
+    { start: '2027-01-05T09:00', end: '2027-01-05T10:00', lux: 80 },
+  ]}));
+  ok(r.status === 200 && r.json.record.exposure === 4800,
+     '作废记录不参与重叠校验：同区间可重新归档（4800）');
+  v = r.json.version;
+
+  console.log('# 30. 计划外曝光计入额度组已用量；有记录的作品不可删除');
+  r = await call('POST', '/api/groups', { version: v, name: '计划外测试组', limit: 20000, memberIds: [recArt] });
+  ok(r.status === 200, '测试额度组已创建（上限 20000）');
+  v = r.json.version;
+  const gRec = r.json.groups.find((g) => g.name === '计划外测试组');
+  ok(gRec.used === 4800 && gRec.unplanned === 4800 && gRec.reservedScheduled === 6000
+     && gRec.balance === 9200,
+     `组已用含有效计划外曝光（已用 ${gRec.used} / 预占 ${gRec.reserved} / 余额 ${gRec.balance}）`);
+  r = await call('POST', '/api/artworks', { version: v, name: '记录删除测试品', limit: 100000, existing: 0 });
+  v = r.json.version;
+  const delArt = r.json.artworks.at(-1).id;
+  r = await call('POST', '/api/exposure-records', { version: v, artworkId: delArt,
+    start: '2027-02-01T09:00', end: '2027-02-01T09:30',
+    segments: [{ start: '2027-02-01T09:00', end: '2027-02-01T09:30', lux: 10 }] });
+  v = r.json.version;
+  r = await call('DELETE', `/api/artworks/${delArt}`, { version: v });
+  ok(r.status === 409 && r.json.error.code === 'IN_USE', '有计划外曝光记录的作品不可删除（归档保留）');
+
   console.log(`\n结果：${pass} 通过，${fail} 失败`);
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error(e); process.exit(1); });

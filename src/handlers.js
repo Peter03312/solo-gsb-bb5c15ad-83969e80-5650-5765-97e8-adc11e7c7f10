@@ -101,6 +101,10 @@ function deleteArtwork(db, id, body) {
       SELECT g.name FROM quota_group_members m JOIN quota_groups g ON g.id = m.group_id WHERE m.artwork_id = ?
     `).get(id);
     if (gref) throw new HttpError(409, 'IN_USE', `作品 #${id} 属于额度组「${gref.name}」，请先在组配置中移除该成员`);
+    const recRef = db.prepare('SELECT COUNT(*) AS c FROM exposure_records WHERE artwork_id = ?').get(id).c;
+    if (recRef > 0) {
+      throw new HttpError(409, 'IN_USE', `作品 #${id} 有 ${recRef} 条计划外曝光记录（含已作废），归档记录只能更正或作废，不能随作品删除`);
+    }
     const r = db.prepare('DELETE FROM artworks WHERE id = ?').run(id);
     if (r.changes === 0) throw new HttpError(404, 'NOT_FOUND', `作品 #${id} 不存在`);
     B.bumpVersion(db);
@@ -320,13 +324,31 @@ function replaceSchedule(db, body) {
     }
   }
 
+  // 新时段与有效计划外曝光记录之间（后续排期不得覆盖有效记录）
+  const activeRecords = B.loadExposureRecords(db).filter((r) => r.status === 'active');
+  for (const p of proposed) {
+    for (const r of activeRecords) {
+      if (!p.artworkIds.includes(r.artwork_id)) continue;
+      const rs = B.parseDateTime(r.start_time).minutes;
+      const re = B.parseDateTime(r.end_time).minutes;
+      if (p.startMin < re && rs < p.endMin) {
+        addOverlap(r.artwork_id, p, {
+          cid: `record#${r.id}`, hall: '计划外曝光',
+          start: r.start_time, end: r.end_time, lux: r.lux,
+          artworkIds: [r.artwork_id],
+          label: `计划外曝光记录 #${r.id} ${r.start_time} ~ ${r.end_time}（有效）`,
+        }, 'new-record');
+      }
+    }
+  }
+
   if (overlapConflicts.length) {
     throw new HttpError(422, 'BATCH_REJECTED', '整批已拒绝：存在同作品时段重叠', {
       conflicts: overlapConflicts,
     });
   }
 
-  // 2) 预算：既有 + 进行中预占 + 本批未开始预占 <= 上限（单件与额度组同时满足）
+  // 2) 预算：既有 + 有效计划外曝光 + 进行中预占 + 本批未开始预占 <= 上限（单件与额度组同时满足）
   const used = new Map(artworks.map((a) => [a.id, a.existing_amount]));
   for (const f of frozen) {
     for (const aid of f.artworkIds) {
@@ -334,6 +356,10 @@ function replaceSchedule(db, body) {
       if (f.status === 'finished') used.set(aid, used.get(aid) + (f.actual_exposure || 0));
       else used.set(aid, used.get(aid) + (B.plannedExposure(f) || 0));
     }
+  }
+  // 有效计划外曝光计入已用量（历史实耗）
+  for (const r of activeRecords) {
+    if (used.has(r.artwork_id)) used.set(r.artwork_id, used.get(r.artwork_id) + r.exposure);
   }
 
   const budgetExceeded = [];
@@ -638,6 +664,218 @@ function correctSlot(db, id, body) {
   return tx.immediate();
 }
 
+// ---------- 计划外曝光记录 ----------
+// 布展 / 搬运等排期外受光：选一件作品，录入实际起止与连续照度分段并归档。
+// 有效记录计入作品与所属额度组的已用量；已归档记录只能带理由更正分段（沿用原区间）或作废。
+
+// 同一作品的记录不得与已有时段（未开始/进行中按计划区间，已结束按实际区间）
+// 或其他有效计划外记录重叠；冲突指出对象与区间。
+function findRecordConflicts(db, artworkId, artworkName, startMin, endMin, excludeRecordId = null) {
+  const conflicts = [];
+  for (const s of B.loadSlots(db)) {
+    if (!s.artworkIds.includes(artworkId)) continue;
+    let sStr, eStr, statusLabel;
+    if (s.status === 'finished') {
+      sStr = s.actual_start; eStr = s.actual_end; statusLabel = '已结束时段（实际区间）';
+    } else if (s.status === 'running') {
+      sStr = s.planned_start; eStr = s.planned_end; statusLabel = '进行中时段（冻结区间）';
+    } else {
+      sStr = s.planned_start; eStr = s.planned_end; statusLabel = '未开始时段（计划区间）';
+    }
+    const ss = B.parseDateTime(sStr).minutes;
+    const se = B.parseDateTime(eStr).minutes;
+    if (startMin < se && ss < endMin) {
+      conflicts.push({
+        artworkId, artworkName, kind: 'slot',
+        slot: { id: s.id, hall: s.hall, status: s.status, start: sStr, end: eStr },
+        label: `${statusLabel} #${s.id} ${s.hall} ${sStr} ~ ${eStr}`,
+      });
+    }
+  }
+  for (const r of B.loadExposureRecords(db)) {
+    if (r.status !== 'active' || r.artwork_id !== artworkId || r.id === excludeRecordId) continue;
+    const rs = B.parseDateTime(r.start_time).minutes;
+    const re = B.parseDateTime(r.end_time).minutes;
+    if (startMin < re && rs < endMin) {
+      conflicts.push({
+        artworkId, artworkName, kind: 'record',
+        record: { id: r.id, start: r.start_time, end: r.end_time },
+        label: `计划外曝光记录 #${r.id} ${r.start_time} ~ ${r.end_time}（有效）`,
+      });
+    }
+  }
+  return conflicts;
+}
+
+function validateReason(body) {
+  const reason = typeof body.reason === 'string' ? body.reason.trim() : '';
+  if (!reason) throw new HttpError(422, 'VALIDATION', '必须填写理由（reason）', { field: 'reason' });
+  if (reason.length > 500) throw new HttpError(422, 'VALIDATION', '理由过长（最多 500 字）', { field: 'reason' });
+  return reason;
+}
+
+function blockedScheduled(state) {
+  return state.slots
+    .filter((s) => s.status === 'scheduled' && s.blocked)
+    .sort((a, b) => a.seq - b.seq);
+}
+
+// body: { version, artworkId, start, end, segments: [{start,end,lux}] }
+function createExposureRecord(db, body) {
+  requireVersion(db, body);
+  const artworkId = Number(body.artworkId);
+  if (!Number.isInteger(artworkId) || artworkId <= 0) {
+    throw new HttpError(422, 'VALIDATION', '需要指定一件作品（artworkId）', { field: 'artworkId' });
+  }
+  const art = db.prepare('SELECT * FROM artworks WHERE id = ?').get(artworkId);
+  if (!art) throw new HttpError(422, 'VALIDATION', `作品 #${artworkId} 不存在`, { field: 'artworkId' });
+
+  const as = B.parseDateTime(body.start, '实际开始时间');
+  const ae = B.parseDateTime(body.end, '实际结束时间');
+  if (as.error) throw new HttpError(422, 'SEGMENTS_INVALID', as.error, { segmentErrors: [as.error] });
+  if (ae.error) throw new HttpError(422, 'SEGMENTS_INVALID', ae.error, { segmentErrors: [ae.error] });
+  if (ae.minutes <= as.minutes) {
+    throw new HttpError(422, 'SEGMENTS_INVALID', '时序无效：实际结束必须晚于实际开始（区间须为正时长）', {
+      segmentErrors: ['时序无效：实际结束必须晚于实际开始（区间须为正时长）'],
+    });
+  }
+
+  const result = B.validateSegments(body.segments, body.start, body.end, '实际区间');
+  if (result.errs) {
+    throw new HttpError(422, 'SEGMENTS_INVALID', '计划外曝光记录已拒绝：分段必须首尾衔接、无重叠且完整覆盖实际区间', {
+      segmentErrors: result.errs,
+    });
+  }
+
+  const conflicts = findRecordConflicts(db, artworkId, art.name, as.minutes, ae.minutes);
+  if (conflicts.length) {
+    throw new HttpError(422, 'OVERLAP_CONFLICT', '计划外曝光记录与已有时段或其他有效记录重叠', { conflicts });
+  }
+
+  const tx = db.transaction(() => {
+    const startStr = B.toDTStr(as.date);
+    const endStr = B.toDTStr(ae.date);
+    const segments = normalizeSegStrings(result.segments);
+    const id = db.prepare(`
+      INSERT INTO exposure_records (artwork_id, start_time, end_time, lux, minutes, exposure, segments, status, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)
+    `).run(
+      artworkId, startStr, endStr,
+      B.representativeLux(segments), result.minutes, result.exposure,
+      JSON.stringify(segments), localNowString(),
+    ).lastInsertRowid;
+
+    // 历史实耗允许余额为负；按现有顺序重算未开始时段的缺口与启动阻断
+    B.recomputeBlocked(db);
+    B.bumpVersion(db);
+    const state = B.summarize(db);
+    return {
+      ...state,
+      record: state.exposureRecords.find((r) => r.id === id),
+      blockedAfterRecord: blockedScheduled(state),
+    };
+  });
+  return tx.immediate();
+}
+
+// body: { version, reason, segments:[{start,end,lux}] } —— 更正沿用原区间，只调整照度分段
+function correctExposureRecord(db, id, body) {
+  const tx = db.transaction(() => {
+    const rec = db.prepare('SELECT * FROM exposure_records WHERE id = ?').get(id);
+    if (!rec) throw new HttpError(404, 'NOT_FOUND', `计划外曝光记录 #${id} 不存在`);
+    requireVersion(db, body);
+    if (rec.status !== 'active') {
+      throw new HttpError(422, 'RECORD_VOIDED', `记录 #${id} 已作废，不能再更正分段`);
+    }
+    const reason = validateReason(body);
+
+    const result = B.validateSegments(body.segments, rec.start_time, rec.end_time, '原实际区间');
+    if (result.errs) {
+      throw new HttpError(422, 'SEGMENTS_INVALID', '更正已拒绝：分段必须首尾衔接、无重叠且完整覆盖原实际区间', {
+        segmentErrors: result.errs,
+      });
+    }
+    const beforeSegs = JSON.parse(rec.segments || '[]');
+    const afterSegs = normalizeSegStrings(result.segments);
+    const seqRow = db.prepare('SELECT COALESCE(MAX(seq_no), 0) + 1 AS next FROM exposure_record_events WHERE record_id = ?').get(id);
+    const createdAt = localNowString();
+
+    // 变动历史（只增不改）：保留更正前后值与理由
+    db.prepare(`
+      INSERT INTO exposure_record_events (
+        record_id, seq_no, action, reason,
+        before_status, before_lux, before_minutes, before_exposure, before_segments,
+        after_status, after_lux, after_minutes, after_exposure, after_segments,
+        created_at
+      ) VALUES (?, ?, 'correct', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id, seqRow.next, reason,
+      rec.status, rec.lux, rec.minutes, rec.exposure, JSON.stringify(beforeSegs),
+      'active', B.representativeLux(afterSegs), result.minutes, result.exposure, JSON.stringify(afterSegs),
+      createdAt,
+    );
+
+    // 新总量替换旧总量（不重复累计），区间沿用原值
+    db.prepare('UPDATE exposure_records SET lux = ?, minutes = ?, exposure = ?, segments = ? WHERE id = ?')
+      .run(B.representativeLux(afterSegs), result.minutes, result.exposure, JSON.stringify(afterSegs), id);
+
+    B.recomputeBlocked(db);
+    B.bumpVersion(db);
+    const state = B.summarize(db);
+    const record = state.exposureRecords.find((r) => r.id === id);
+    return {
+      ...state,
+      record,
+      recordEvent: record.events.find((e) => e.seqNo === seqRow.next),
+      blockedAfterRecord: blockedScheduled(state),
+    };
+  });
+  return tx.immediate();
+}
+
+// body: { version, reason } —— 作废保留归档，不再计入已用量、不参与重叠校验
+function voidExposureRecord(db, id, body) {
+  const tx = db.transaction(() => {
+    const rec = db.prepare('SELECT * FROM exposure_records WHERE id = ?').get(id);
+    if (!rec) throw new HttpError(404, 'NOT_FOUND', `计划外曝光记录 #${id} 不存在`);
+    requireVersion(db, body);
+    if (rec.status !== 'active') {
+      throw new HttpError(422, 'RECORD_VOIDED', `记录 #${id} 已是作废状态`);
+    }
+    const reason = validateReason(body);
+
+    const seqRow = db.prepare('SELECT COALESCE(MAX(seq_no), 0) + 1 AS next FROM exposure_record_events WHERE record_id = ?').get(id);
+    const createdAt = localNowString();
+    db.prepare(`
+      INSERT INTO exposure_record_events (
+        record_id, seq_no, action, reason,
+        before_status, before_lux, before_minutes, before_exposure, before_segments,
+        after_status, after_lux, after_minutes, after_exposure, after_segments,
+        created_at
+      ) VALUES (?, ?, 'void', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id, seqRow.next, reason,
+      rec.status, rec.lux, rec.minutes, rec.exposure, rec.segments,
+      'voided', rec.lux, rec.minutes, rec.exposure, rec.segments,
+      createdAt,
+    );
+    db.prepare("UPDATE exposure_records SET status = 'voided' WHERE id = ?").run(id);
+
+    // 作废后同步重算已用量、未开始时段缺口与启动阻断
+    B.recomputeBlocked(db);
+    B.bumpVersion(db);
+    const state = B.summarize(db);
+    const record = state.exposureRecords.find((r) => r.id === id);
+    return {
+      ...state,
+      record,
+      recordEvent: record.events.find((e) => e.seqNo === seqRow.next),
+      blockedAfterRecord: blockedScheduled(state),
+    };
+  });
+  return tx.immediate();
+}
+
 // 统一落库时间字符串为 YYYY-MM-DDTHH:mm（丢弃秒，避免与区间覆盖校验不一致）
 function normalizeSegStrings(segments) {
   const norm = (s) => String(s).trim().replace(' ', 'T').slice(0, 16);
@@ -656,4 +894,5 @@ module.exports = {
   createGroup, updateGroup, deleteGroup,
   replaceSchedule, startSlot, finishSlot,
   settleSlotSegments, correctSlot,
+  createExposureRecord, correctExposureRecord, voidExposureRecord,
 };
